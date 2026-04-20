@@ -1,0 +1,65 @@
+# Whitelist approach: ignore everything by default, allow only what the
+# repository tracks. Directories are un-ignored individually so git can
+# traverse them and see the whitelisted contents.
+
+# Ignore everything
+*
+
+# Un-ignore directories globally so git can traverse them to find whitelisted
+# contents (e.g. the .gitkeep placeholders below). Without this, git never
+# enters read/, checkpoints/, write/ and the whitelist never fires.
+!*/
+
+# Whitelist tracked code, project files, and metadata context
+!scripts/
+!scripts/**
+!context/
+!context/**
+!README.md
+!ep-cellchat-analysis.Rproj
+!.gitignore
+
+# Expose .gitkeep placeholders so the data-directory structure is visible
+!read/.gitkeep
+!checkpoints/.gitkeep
+!write/figures/.gitkeep
+!write/tables/.gitkeep
+
+# Belt-and-braces: re-ignore directory contents even if rules above change
+read/*
+!read/.gitkeep
+checkpoints/*
+!checkpoints/.gitkeep
+write/figures/*
+!write/figures/.gitkeep
+write/tables/*
+!write/tables/.gitkeep
+
+# reports/ lives outside version control (analysis drafts, interpretation notes)
+# Already covered by the initial `*` rule; listed explicitly so the intent is
+# obvious to future readers.
+reports/
+reports/**
+
+# scripts/runners/ is local machine driver code, not part of the shared analysis
+scripts/runners/
+scripts/runners/**
+
+# Script-local rendered outputs, caches, intermediates
+scripts/*.html
+scripts/*_files/
+scripts/.quarto/
+scripts/_freeze/
+scripts/_site/
+scripts/*_cache/
+scripts/.Rproj.user/
+
+# R intermediates anywhere in the tree
+.Rhistory
+.RData
+.Rapp.history
+.Rproj.user/
+
+# OS cruft
+.DS_Store
+Thumbs.db
