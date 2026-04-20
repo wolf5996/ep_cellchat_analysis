@@ -10,11 +10,9 @@
 # enters read/, checkpoints/, write/ and the whitelist never fires.
 !*/
 
-# Whitelist tracked code, project files, and metadata context
+# Whitelist tracked code and project files
 !scripts/
 !scripts/**
-!context/
-!context/**
 !README.md
 !ep-cellchat-analysis.Rproj
 !.gitignore
@@ -35,11 +33,13 @@ write/figures/*
 write/tables/*
 !write/tables/.gitkeep
 
-# reports/ lives outside version control (analysis drafts, interpretation notes)
-# Already covered by the initial `*` rule; listed explicitly so the intent is
-# obvious to future readers.
+# reports/ and context/ live outside version control (private analysis notes
+# and the original analysis brief). Already covered by the initial `*` rule;
+# listed explicitly so the intent is obvious to future readers.
 reports/
 reports/**
+context/
+context/**
 
 # scripts/runners/ is local machine driver code, not part of the shared analysis
 scripts/runners/

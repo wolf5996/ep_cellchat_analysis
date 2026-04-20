@@ -27,7 +27,7 @@ Notebook 04's expensive `computeCommunProb` step is also mirrored into a set of 
 ```
 ep_cellchat_analysis/
 ├── ep-cellchat-analysis.Rproj      # RStudio project file (at root)
-├── .gitignore                      # Whitelist approach, only scripts/ and context/ tracked
+├── .gitignore                      # Whitelist approach, only scripts/ tracked
 ├── README.md                       # This file
 ├── scripts/                        # All analysis code, tracked
 │   ├── 01-data-import-qc.qmd
@@ -36,9 +36,7 @@ ep_cellchat_analysis/
 │   ├── 04-cellchat-tumor.qmd
 │   ├── 05-hallmark-module-scores.qmd
 │   └── runners/                    # Local .R runners for 04, git-ignored
-├── context/                        # Brief + data context, tracked
-│   ├── data_context.md
-│   └── gse125969_analysis_brief.md
+├── context/                        # Analysis brief + data context, NOT tracked (local only)
 ├── read/                           # Raw input data (GSE125969 TSVs), NOT tracked
 ├── checkpoints/                    # Intermediate .rds files, NOT tracked
 ├── write/                          # Generated outputs, NOT tracked
@@ -52,7 +50,6 @@ ep_cellchat_analysis/
 ## What is tracked
 
 - `scripts/**` (notebooks), excluding `scripts/runners/`
-- `context/**` (analysis brief, data context notes)
 - `README.md`, `.gitignore`, `ep-cellchat-analysis.Rproj`
 - `.gitkeep` placeholders inside `read/`, `checkpoints/`, `write/figures/`, `write/tables/` (so the expected directory layout is visible in a fresh clone without committing the data itself)
 
@@ -62,6 +59,7 @@ ep_cellchat_analysis/
 - Intermediate `.rds` checkpoints under `checkpoints/`
 - All generated figures, tables, and ShinyCell apps under `write/`
 - Interpretation drafts under `reports/`
+- Analysis brief and data-context notes under `context/` (local use only)
 - Local runner scripts under `scripts/runners/`
 
 ## Replication
