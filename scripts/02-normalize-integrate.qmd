@@ -1,0 +1,508 @@
+---
+title: "02. Normalisation, Dimensionality Reduction, and Harmony Integration"
+subtitle: "Seurat v5 layered workflow (Pillar 1 deliverable)"
+author: "Badran Elshenawy"
+date: today
+format:
+  html:
+    theme: darkly
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    code-tools: true
+    embed-resources: true
+    self-contained: true
+    title-block-banner: true
+engine: knitr
+execute:
+  eval: false
+  warning: false
+  message: false
+---
+
+# Context
+
+-   **Role of this notebook**: the Pillar 1 deliverable. Cross-patient integration of the 26-patient ependymoma cohort into a single analytical space, with a pre-vs-post figure that visually demonstrates integration success.
+-   **Approach**: Seurat v5 layered integration workflow (`IntegrateLayers()`) with `HarmonyIntegration`.
+-   **Why Harmony and not RPCA**: RPCA was tried first and failed. The anchor-finding step runs a per-layer SVD, and the cohort contains singleton-patient subgroups (PFB n=1, ST-YAP n=1) whose layers are too small to support the requested PC count. Harmony's soft-clustering formulation doesn't require per-layer SVD, so it tolerates imbalanced layer sizes cleanly. For a 26-patient cohort with a long tail of small samples, Harmony is the defensible choice.
+-   **Batch variable**: `patient_id` (26 levels). **Biological covariates preserved** (not regressed): `tumor_subtype`, `location`, and the shipped `cell_type` column. Harmony mixes cells across patients within a cell-type neighbourhood, not across cell types.
+
+# Seurat v5 layer architecture
+
+-   **Layer split before integration**: `seu[["RNA"]] <- split(seu[["RNA"]], f = seu$patient_id)` puts each patient's counts in a separate layer. Normalisation and variable feature selection then run per-layer, producing a consensus set of variable features that is independent of any one patient's depth.
+-   **Global PCA**: `RunPCA()` operates on the concatenated scaled matrix, so a single `pca` reduction serves as the input both for the unintegrated baseline UMAP and for `HarmonyIntegration`.
+-   **JoinLayers at the end**: before downstream differential expression (notebook 03) the per-patient counts are rejoined into a single `counts` layer so `FindAllMarkers()` has the matrix it expects.
+
+# Checkpoint convention
+
+| Stage | File | Description |
+|------------------|------------------|------------------------------------|
+| Pre-integration | `02-ep-seu-preintegration.rds` | Split layers, LogNormalize, HVFs, ScaleData, PCA, unintegrated UMAP |
+| Integrated | `02-ep-seu-integrated.rds` | \+ Harmony reduction, SNN graph, Louvain clusters, Harmony UMAP, joined layers |
+
+# Normalisation, variable features, PCA
+
+-   **Pipeline** (per the Seurat v5 integration vignette):
+    -   `NormalizeData()`: `LogNormalize` with `scale.factor = 1e4` (standard)
+    -   `FindVariableFeatures()`: `vst` method, top 2000 features (per the brief)
+    -   `ScaleData()`: centre and scale, no `vars.to.regress` (I deliberately avoid regressing out `percent.mt` here; interpretable biology is the priority and regression can absorb real signal in small populations)
+    -   `RunPCA()`: 50 PCs computed, top 30 used downstream based on the elbow
+-   **What runs per-layer vs. globally**:
+    -   Per-layer: `NormalizeData`, `FindVariableFeatures` (consensus features across layers)
+    -   Global (concatenated matrix): `ScaleData`, `RunPCA`
+-   **Why this ordering matters**: splitting layers *before* normalisation is the v5 pattern. Splitting after normalisation silently reuses the globally-normalised data and defeats the per-batch variance stabilisation that makes integration necessary in the first place.
+
+```{r}
+#| label: preintegration-pipeline
+
+# Libraries ----------
+library(Seurat)
+library(readr)
+
+# Inputs ----------
+seu <- read_rds("checkpoints/01-ep-seu-filtered.rds")
+
+# Processing: split layers by patient, then the standard pre-integration pipeline ----------
+seu[["RNA"]] <- split(seu[["RNA"]], f = seu$patient_id)
+
+seu <- NormalizeData(seu, normalization.method = "LogNormalize", scale.factor = 1e4)
+seu <- FindVariableFeatures(seu, selection.method = "vst", nfeatures = 3000)
+seu <- ScaleData(seu)
+seu <- RunPCA(seu, npcs = 50, verbose = FALSE)
+
+# Outputs ----------
+write_rds(seu, "checkpoints/02-ep-seu-preintegration.rds")
+```
+
+| Parameter | Value | Justification |
+|------------------|------------------|------------------------------------|
+| `selection.method` | `"vst"` | Standard variance-stabilising feature selection |
+| `nfeatures` | 2000 | Brief requirement; standard for ependymoma-scale cohorts |
+| `scale.factor` | 1e4 | Seurat default; consistent with the Gillen paper's choices |
+| `npcs` | 50 | Compute broadly, subset to top 30 downstream after elbow inspection |
+
+# Elbow plot and PC selection
+
+-   **Purpose**: choose `dims` for the Harmony + UMAP steps. The brief specifies top 30 PCs as the default; the elbow is a sanity check.
+-   **Expectation**: elbow typically lands around PC 20–30 for a 26-sample immune-infiltrated tumour cohort. If the curve is still steeply declining past PC 30, flag it and bump to 40.
+-   **Plot choice**: `BadranSeq::EnhancedElbowPlot()`, plots variance explained (not standard deviation), highlights the `cutoff_pc = 30` line, publication-ready out of the box.
+
+```{r}
+#| label: elbow-plot
+#| fig-width: 8
+#| fig-height: 6
+
+# Libraries ----------
+library(Seurat)
+library(BadranSeq)
+library(readr)
+library(tidyverse)
+
+# Inputs ----------
+seu <- read_rds("checkpoints/02-ep-seu-preintegration.rds")
+
+# Processing ----------
+plot_elbow <- EnhancedElbowPlot(
+  seu,
+  ndims = 50,
+  reduction = "pca",
+  cutoff_pc = 30,
+  variance = TRUE,
+  title = "PCA elbow -- 50 PCs computed, 30 used downstream"
+)
+
+# Inspect ----------
+plot_elbow
+
+# Outputs ----------
+ggsave(
+  filename = "write/figures/02-elbow-plot.pdf",
+  plot = plot_elbow,
+  width = 8, height = 6, bg = "white"
+)
+```
+
+# Baseline: unintegrated UMAP
+
+-   **Purpose**: establish the "bad" embedding for the pre-vs-post comparison. A UMAP computed directly on the `pca` reduction exposes patient-level batch effects as the dominant source of structure, which is the point.
+-   **Reduction name**: `umap.unintegrated`, explicit suffix so the baseline embedding sits alongside the Harmony UMAP without being overwritten.
+
+```{r}
+#| label: baseline-umap
+
+# Libraries ----------
+library(Seurat)
+library(readr)
+
+# Inputs ----------
+seu <- read_rds("checkpoints/02-ep-seu-preintegration.rds")
+
+# Processing ----------
+seu <- RunUMAP(
+  seu,
+  reduction = "pca",
+  dims = 1:30,
+  reduction.name = "umap.unintegrated",
+  verbose = FALSE
+)
+
+# Outputs ----------
+write_rds(seu, "checkpoints/02-ep-seu-preintegration.rds")
+```
+
+# Harmony integration
+
+-   **Method**: iterative soft-clustering with batch correction in PC space. Unlike RPCA, Harmony never touches a per-layer SVD; it works on the concatenated PC matrix with a batch label. This is why it tolerates the PFB and ST-YAP singleton patients that broke the RPCA run.
+-   **Output slot**: `integrated.harmony`, a cell × PC matrix in the same shape as `pca`. Downstream `FindNeighbors`, `FindClusters`, `RunUMAP` all point at this slot.
+-   **Memory footprint**: the serialised object passes the `future` ceiling (default 500 MiB) when Seurat v5 parallelises anchor evaluation. Bump it to 8 GiB at the top of the chunk, harmless when not needed, essential when it is.
+
+```{r}
+#| label: harmony-integration
+
+# Libraries ----------
+library(Seurat)
+library(harmony)
+library(readr)
+
+# Setup ----------
+options(future.globals.maxSize = 8 * 1024^3)
+
+# Inputs ----------
+seu <- read_rds("checkpoints/02-ep-seu-preintegration.rds")
+
+# Processing ----------
+seu <- IntegrateLayers(
+  object = seu,
+  method = HarmonyIntegration,
+  orig.reduction = "pca",
+  new.reduction = "integrated.harmony",
+  verbose = FALSE
+)
+
+# Outputs ----------
+write_rds(seu, "checkpoints/02-ep-seu-integrated.rds")
+```
+
+# Clustering and UMAP on the Harmony embedding
+
+-   **Parameters** (per the brief):
+    -   `FindNeighbors(k.param = 20)`. SNN graph neighbourhood size
+    -   `FindClusters(algorithm = 1, resolution = 0.6)`. Louvain, moderate resolution
+    -   `RunUMAP(dims = 1:30)`, top 30 PCs of the Harmony embedding
+-   **Cluster column name**: `clusters.harmony` so the Louvain assignment is explicitly scoped to the reduction it came from.
+-   **UMAP reduction name**: `umap.harmony` so it sits alongside `umap.unintegrated` for the pre-vs-post comparison.
+
+```{r}
+#| label: harmony-clusters-umap
+
+# Libraries ----------
+library(Seurat)
+library(readr)
+
+# Inputs ----------
+seu <- read_rds("checkpoints/02-ep-seu-integrated.rds")
+
+# Processing ----------
+seu <- FindNeighbors(
+  seu,
+  reduction = "integrated.harmony",
+  dims = 1:30,
+  k.param = 20,
+  verbose = FALSE
+)
+seu <- FindClusters(
+  seu,
+  resolution = 0.6,
+  cluster.name = "clusters.harmony",
+  algorithm = 1,
+  verbose = FALSE
+)
+seu <- RunUMAP(
+  seu,
+  reduction = "integrated.harmony",
+  dims = 1:30,
+  reduction.name = "umap.harmony",
+  verbose = FALSE
+)
+
+# Outputs ----------
+write_rds(seu, "checkpoints/02-ep-seu-integrated.rds")
+```
+
+# Inline UMAP inspection
+
+-   **Purpose**: print each UMAP on its own in the notebook so it can be eyeballed, tweaked, and saved independently. Each chunk builds one figure, prints it for inspection, then ships it to `write/figures/`.
+-   **Panels to produce**:
+    -   Unintegrated × `patient_id`, shows batch dominance without correction
+    -   Unintegrated × `cell_type`, shows whether author-assigned types already cluster without batch correction
+    -   Harmony × `patient_id`, shows batch mixing after correction (integration success)
+    -   Harmony × `cell_type`, shows biology preserved across patients (integration didn't over-correct)
+-   **`cell_type` choice**: the shipped coarse author labels from Gillen et al. They're used here as an *independent* biology signal to check integration quality, notebook 03 re-annotates from scratch using markers and `FindAllMarkers()`: so these labels are never relied on downstream.
+
+## Unintegrated, patient_id
+
+```{r}
+#| label: umap-unintegrated-patient
+#| fig-width: 8
+#| fig-height: 6
+
+# Libraries ----------
+library(Seurat)
+library(BadranSeq)
+library(readr)
+
+# Inputs ----------
+seu <- read_rds("checkpoints/02-ep-seu-integrated.rds")
+
+# Processing ----------
+plot_unint_patient <- do_DimPlot(
+  seu,
+  reduction = "umap.unintegrated",
+  group.by = "patient_id"
+) +
+  labs(title = "Unintegrated -- patient_id (expected: batch dominance)")
+
+# Inspect ----------
+plot_unint_patient
+
+# Outputs ----------
+ggsave(
+  filename = "write/figures/02-umap-unintegrated-patient.pdf",
+  plot = plot_unint_patient,
+  width = 10, height = 10, bg = "white"
+)
+```
+
+## Unintegrated, cell_type
+
+```{r}
+#| label: umap-unintegrated-celltype
+#| fig-width: 8
+#| fig-height: 6
+
+# Libraries ----------
+library(Seurat)
+library(BadranSeq)
+library(readr)
+
+# Inputs ----------
+seu <- read_rds("checkpoints/02-ep-seu-integrated.rds")
+
+# Processing ----------
+plot_unint_celltype <- do_DimPlot(
+  seu,
+  reduction = "umap.unintegrated",
+  group.by = "cell_type"
+) +
+  labs(title = "Unintegrated -- cell_type (Gillen shipped labels)")
+
+# Inspect ----------
+plot_unint_celltype
+
+# Outputs ----------
+ggsave(
+  filename = "write/figures/02-umap-unintegrated-celltype.pdf",
+  plot = plot_unint_celltype,
+  width = 10, height = 10, bg = "white"
+)
+```
+
+## Harmony, patient_id
+
+```{r}
+#| label: umap-harmony-patient
+#| fig-width: 8
+#| fig-height: 6
+
+# Libraries ----------
+library(Seurat)
+library(BadranSeq)
+library(readr)
+
+# Inputs ----------
+seu <- read_rds("checkpoints/02-ep-seu-integrated.rds")
+
+# Processing ----------
+plot_harm_patient <- do_DimPlot(
+  seu,
+  reduction = "umap.harmony",
+  group.by = "patient_id"
+) +
+  labs(title = "Harmony -- patient_id (expected: uniform mixing)")
+
+# Inspect ----------
+plot_harm_patient
+
+# Outputs ----------
+ggsave(
+  filename = "write/figures/02-umap-harmony-patient.pdf",
+  plot = plot_harm_patient,
+  width = 10, height = 10, bg = "white"
+)
+```
+
+## Harmony, cell_type
+
+```{r}
+#| label: umap-harmony-celltype
+#| fig-width: 8
+#| fig-height: 6
+
+# Libraries ----------
+library(Seurat)
+library(BadranSeq)
+library(readr)
+
+# Inputs ----------
+seu <- read_rds("checkpoints/02-ep-seu-integrated.rds")
+
+# Processing ----------
+plot_harm_celltype <- do_DimPlot(
+  seu,
+  reduction = "umap.harmony",
+  group.by = "cell_type"
+) +
+  labs(title = "Harmony -- cell_type (expected: biology preserved)")
+
+# Inspect ----------
+plot_harm_celltype
+
+# Outputs ----------
+ggsave(
+  filename = "write/figures/02-umap-harmony-celltype.pdf",
+  plot = plot_harm_celltype,
+  width = 10, height = 10, bg = "white"
+  )
+```
+
+# Integration comparison figure (2×2)
+
+-   **Figure goal**: the Pillar 1 deliverable, a single PDF that shows integration success at a glance.
+-   **Layout**: 2 × 2 grid assembled from the four plots above via `patchwork`.
+    -   Top row: unintegrated × patient_id, unintegrated × cell_type
+    -   Bottom row: harmony × patient_id, harmony × cell_type
+-   **Reading the figure**:
+    -   Top-left patient-coloured blobs collapse in the bottom-left (batch removed)
+    -   Top-right cell-type structure persists in the bottom-right (biology preserved)
+
+```{r}
+#| label: integration-comparison-figure
+#| fig-width: 16
+#| fig-height: 12
+
+# Libraries ----------
+library(Seurat)
+library(BadranSeq)
+library(patchwork)
+library(readr)
+
+# Inputs ----------
+seu <- read_rds("checkpoints/02-ep-seu-integrated.rds")
+
+# Processing ----------
+panel_unint_patient <- do_DimPlot(
+  seu, reduction = "umap.unintegrated", group.by = "patient_id"
+) + labs(title = "Unintegrated -- patient_id")
+
+panel_unint_celltype <- do_DimPlot(
+  seu, reduction = "umap.unintegrated", group.by = "cell_type"
+) + labs(title = "Unintegrated -- cell_type")
+
+panel_harm_patient <- do_DimPlot(
+  seu, reduction = "umap.harmony", group.by = "patient_id",
+) + labs(title = "Harmony -- patient_id")
+
+panel_harm_celltype <- do_DimPlot(
+  seu, reduction = "umap.harmony", group.by = "cell_type"
+) + labs(title = "Harmony -- cell_type")
+
+plot_integration_comparison <-
+  (panel_unint_patient | panel_unint_celltype) /
+  (panel_harm_patient  | panel_harm_celltype) +
+  plot_annotation(
+    title = "Integration comparison: unintegrated vs Harmony",
+    subtitle = "Left column: batch variable (patient_id). Right column: biology signal (cell_type)."
+  )
+
+# Inspect ----------
+plot_integration_comparison
+
+# Outputs ----------
+ggsave(
+  filename = "write/figures/02-integration-comparison.pdf",
+  plot = plot_integration_comparison,
+  width = 16, height = 16, bg = "white"
+  )
+```
+
+# Cluster composition sanity check
+
+-   **Purpose**: quantify what the comparison figure shows by eye. A well-integrated cluster should draw cells from most patients; a cluster dominated by one patient is a batch artefact.
+-   **Output**: a cluster × patient matrix saved as a CSV for quick inspection, plus a marginal summary counting how many patients contribute at least 1% to each cluster.
+
+```{r}
+#| label: cluster-composition
+
+# Libraries ----------
+library(Seurat)
+library(tidyverse)
+library(readr)
+
+# Inputs ----------
+seu <- read_rds("checkpoints/02-ep-seu-integrated.rds")
+
+# Processing ----------
+metadata_df <- seu@meta.data |>
+  as_tibble()
+
+composition_harmony <- metadata_df |>
+  dplyr::count(clusters.harmony, patient_id, name = "n_cells") |>
+  pivot_wider(names_from = patient_id, values_from = n_cells, values_fill = 0) |>
+  arrange(clusters.harmony)
+
+# Cluster-level summary: how many patients contribute >=1% to each cluster? ----------
+cluster_diversity <- metadata_df |>
+  dplyr::count(clusters.harmony, patient_id, name = "n_cells") |>
+  group_by(clusters.harmony) |>
+  mutate(frac = n_cells / sum(n_cells)) |>
+  summarise(
+    n_patients_gte_1pct  = sum(frac >= 0.01),
+    n_patients_gte_5pct  = sum(frac >= 0.05),
+    dominant_patient     = patient_id[which.max(frac)],
+    dominant_fraction    = max(frac),
+    .groups = "drop"
+  ) |>
+  arrange(desc(dominant_fraction))
+
+# Outputs ----------
+write_csv(composition_harmony, "write/tables/02-cluster-composition-harmony.csv")
+write_csv(cluster_diversity,   "write/tables/02-cluster-diversity-harmony.csv")
+```
+
+# Rejoin layers for downstream work
+
+-   **Why**: the annotation notebook (03) runs `FindAllMarkers()`: which requires a single, rejoined `counts` layer, not per-patient layers. `JoinLayers()` is the v5 canonical way to collapse the per-batch counts back into one matrix without losing the integrated reductions.
+-   **What survives**: PCA, `integrated.harmony`, both UMAPs (`umap.unintegrated`, `umap.harmony`), `clusters.harmony`, full metadata.
+
+```{r}
+#| label: join-layers
+
+# Libraries ----------
+library(Seurat)
+library(readr)
+
+# Inputs ----------
+seu <- read_rds("checkpoints/02-ep-seu-integrated.rds")
+
+# Processing ----------
+seu <- JoinLayers(seu)
+
+# Outputs ----------
+write_rds(seu, "checkpoints/02-ep-seu-integrated.rds")
+```
+
+# Next steps
+
+-   **Notebook 03** loads `02-ep-seu-integrated.rds`, uses `clusters.harmony` as the working cluster assignment, runs `FindAllMarkers()` on the rejoined `counts` layer, and applies marker-based annotation (CSF1R/CX3CR1/P2RY12/TMEM119 for microglia, CD68/CD163 for macrophages, CD3D/CD3E/CD8A for T cells, GFAP/OLIG2 for tumour/glial).
+-   The myeloid compartment is then sub-clustered into microglia / macrophage / monocyte, required for CellChat in notebook 04, since the brief explicitly forbids running CellChat on a single collapsed "myeloid" group.
+

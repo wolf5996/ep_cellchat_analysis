@@ -1,0 +1,355 @@
+---
+title: "01. Data Import and Quality Control"
+subtitle: "GSE125969 ependymoma cohort (Gillen et al. 2020)"
+author: "Badran Elshenawy"
+date: today
+format:
+  html:
+    theme: darkly
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    code-tools: true
+    embed-resources: true
+    self-contained: true
+    title-block-banner: true
+engine: knitr
+execute:
+  eval: false
+  warning: false
+  message: false
+---
+
+# Context
+
+-   **Cohort**: GSE125969, 26 paediatric ependymoma patients, 10x Chromium scRNA-seq (Gillen et al. 2020, *Cell Reports*)
+-   **Analytical framing**: re-analysis of the comparator cohort used in Andrade et al. 2024 (*Nat Commun*) to independently characterise the ependymoma TME against the K27M HGG phenotype
+-   **Scope of this notebook**:
+    -   Read the published count matrix and cell metadata tables
+    -   Derive a per-cell `patient_id` from the cell barcode prefix (the published metadata ships without one)
+    -   Attach `tumor_subtype` and anatomical `location` as biological covariates (not batch)
+    -   Compute QC metrics and apply conservative per-cell filtration
+    -   Save a filtered Seurat object as the entry point for downstream integration
+
+# Cohort composition
+
+-   **26 patients across five molecular subgroups**, all linked to tumor subgroup via the shipped `tumor_subtype` column:
+    -   **PFA1** (n=12): posterior fossa group A, subtype 1, myeloid-enriched, mesenchymal-prone
+    -   **PFA2** (n=7): posterior fossa group A, subtype 2, ciliated-enriched
+    -   **PFB** (n=1): posterior fossa group B
+    -   **ST-RELA** (n=5): supratentorial RELA-fusion
+    -   **ST-YAP** (n=1): supratentorial YAP1-fusion
+-   **Location is derivable from subtype prefix** (`PF*` vs `ST*`), no separate column needed
+-   **Biological implication for integration**: subtype and location are biological covariates to preserve, not batch effects to remove. `patient_id` is the batch variable Harmony should correct on.
+
+# Checkpoint convention
+
+-   Each notebook loads its predecessor's `.rds` checkpoint and writes its own. Naming follows a step-prefix + short-descriptor scheme so provenance is obvious.
+
+| Stage | File | Description |
+|-------------------|------------------|-----------------------------------|
+| Raw import (post-metadata merge) | `01-ep-seu.rds` | Seurat object with full cohort, unfiltered |
+| Post-QC | `01-ep-seu-filtered.rds` | After cell-level filtration on nFeature, nCount, percent.mt |
+
+# Data import
+
+## Reading the published matrices
+
+-   **Count matrix** (`gse125969_count_matrix.tsv`, \~875 MB): tab-separated, genes as rows, cells as columns. First column holds gene symbols.
+-   **Cell metadata** (`gse125969_cell_metadata.tsv`): tab-separated, one row per cell with `cell_id`, `cell_type` (coarse author labels), `tumor_subtype`, and the paper's precomputed UMAP coordinates.
+-   **Note**: the paper's UMAP columns are ignored here, I recompute my own embedding after Harmony integration in notebook 02.
+
+```{r}
+#| label: read-raw
+
+# Libraries ----------
+library(Seurat)
+library(tidyverse)
+library(readr)
+library(Matrix)
+
+# Inputs ----------
+counts_raw <- read_tsv(
+  "read/gse125969_count_matrix.tsv",
+  progress = FALSE,
+  show_col_types = FALSE
+)
+metadata_raw <- read_tsv(
+  "read/gse125969_cell_metadata.tsv",
+  progress = FALSE,
+  show_col_types = FALSE
+)
+
+# Processing: coerce counts to a gene x cell sparse matrix ----------
+count_matrix <- counts_raw |>
+  column_to_rownames(var = colnames(counts_raw)[1]) |>
+  as.matrix() |>
+  Matrix(sparse = TRUE)
+
+# Sanity ----------
+stopifnot(ncol(count_matrix) == nrow(metadata_raw) ||
+          length(intersect(colnames(count_matrix), metadata_raw$cell_id)) > 0)
+```
+
+## Deriving patient_id from cell barcodes
+
+-   **Problem**: the published metadata has no explicit `patient_id` column. Cell IDs look like `foreman_1239_AAACCTGTCCAGTAGT`, the middle token is the patient's clinical identifier.
+-   **Solution**: extract the numeric patient ID with `stringr::str_extract()` using a lookbehind on the `foreman_` prefix.
+-   **Cohort verification**: 26 distinct `patient_id` values after extraction, exactly matching the 26 GEO samples (GSM4132013–GSM4132038).
+-   **Subtype is already complete**: each patient maps to exactly one `tumor_subtype`, the shipped column is the authoritative link, no external GEO SOFT file lookup required.
+
+```{r}
+#| label: derive-patient-id
+
+# Libraries ----------
+library(tidyverse)
+
+# Processing ----------
+metadata_df <- metadata_raw |>
+  mutate(
+    patient_id = str_extract(cell_id, "(?<=^foreman_)[0-9]+"),
+    location = case_when(
+      str_starts(tumor_subtype, "PF") ~ "posterior_fossa",
+      str_starts(tumor_subtype, "ST") ~ "supratentorial",
+      TRUE ~ NA_character_
+    )
+  )
+
+# Sanity: 26 patients, each mapped to exactly one subtype ----------
+patient_subtype_map <- metadata_df |>
+  distinct(patient_id, tumor_subtype, location) |>
+  arrange(tumor_subtype, patient_id)
+
+n_patients <- n_distinct(metadata_df$patient_id)
+multi_subtype_patients <- patient_subtype_map |>
+  count(patient_id) |>
+  filter(n > 1)
+
+stopifnot(n_patients == 26L, nrow(multi_subtype_patients) == 0L)
+
+# Output: save the patient table for downstream reference ----------
+write_csv(patient_subtype_map, "write/tables/01-patient-subtype-map.csv")
+```
+
+| Column | Derivation | Role |
+|----------------------|--------------------------------|------------------|
+| `patient_id` | `str_extract(cell_id, "(?<=^foreman_)[0-9]+")` | Batch variable for Harmony |
+| `tumor_subtype` | As shipped (PFA1 / PFA2 / PFB / ST-RELA / ST-YAP) | Biological covariate, preserve |
+| `location` | `PF*` → posterior_fossa, `ST*` → supratentorial | Biological covariate, preserve |
+| `cell_type` | As shipped (coarse author labels) | Sanity check only; I re-annotate in 03 |
+
+## Constructing the Seurat object
+
+-   **Cell alignment**: intersect `colnames(count_matrix)` with `metadata_df$cell_id` to drop any cells missing from either table before constructing the Seurat object.
+-   **Metadata row order must match cell order** for `CreateSeuratObject()`: set `rownames(metadata_df)` to `cell_id` and reorder.
+-   **Project name**: `ep_cellchat`, appears in the object as `seu@project.name`.
+
+```{r}
+#| label: build-seurat
+
+# Libraries ----------
+library(Seurat)
+library(tidyverse)
+
+# Inputs ----------
+cells_common <- intersect(colnames(count_matrix), metadata_df$cell_id)
+
+count_matrix_aligned <- count_matrix[, cells_common]
+metadata_aligned <- metadata_df |>
+  filter(cell_id %in% cells_common) |>
+  as.data.frame()
+rownames(metadata_aligned) <- metadata_aligned$cell_id
+metadata_aligned <- metadata_aligned[colnames(count_matrix_aligned), ]
+
+# Sanity: count columns and metadata rows align after reorder ----------
+stopifnot(all(colnames(count_matrix_aligned) == rownames(metadata_aligned)))
+
+# Processing ----------
+seu <- CreateSeuratObject(
+  counts = count_matrix_aligned,
+  meta.data = metadata_aligned,
+  project = "ep_cellchat",
+  min.cells = 3,
+  min.features = 200
+)
+
+# Outputs ----------
+write_rds(seu, "checkpoints/01-ep-seu.rds")
+```
+
+# Quality control
+
+## Computing QC metrics
+
+-   **`percent.mt`**, mitochondrial gene fraction, flags dying / lysing cells leaking cytoplasmic mRNA
+-   **`percent.ribo`**, ribosomal protein gene fraction, useful diagnostic for compositional bias but not used for filtration
+-   **`log10_genes_per_umi`**, complexity score, lower values indicate under-sequenced or low-information cells
+
+```{r}
+#| label: qc-metrics
+
+# Libraries ----------
+library(Seurat)
+library(readr)
+
+# Inputs ----------
+seu <- read_rds("checkpoints/01-ep-seu.rds")
+
+# Processing ----------
+seu[["percent.mt"]]   <- PercentageFeatureSet(seu, pattern = "^MT-")
+seu[["percent.ribo"]] <- PercentageFeatureSet(seu, pattern = "^RP[SL]")
+seu$log10_genes_per_umi <- log10(seu$nFeature_RNA) / log10(seu$nCount_RNA)
+
+# Outputs ----------
+write_rds(seu, "checkpoints/01-ep-seu.rds")
+```
+
+## Per-patient QC visualisation
+
+-   **Purpose**: confirm QC distributions are comparable across the 26 patients before applying a cohort-wide threshold
+-   **Three violin panels**: `nFeature_RNA`, `nCount_RNA`, `percent.mt`, grouped by `patient_id`, coloured by `tumor_subtype`
+-   **What to look for**: patients with systematically lower complexity (e.g. median nFeature \< 500) or elevated mt% should be flagged but not automatically dropped, the brief calls for preserving biological signal
+
+```{r}
+#| label: qc-violins
+#| fig-width: 16
+#| fig-height: 10
+
+# Libraries ----------
+library(Seurat)
+library(tidyverse)
+library(ggplot2)
+library(readr)
+
+# Inputs ----------
+seu <- read_rds("checkpoints/01-ep-seu.rds")
+
+# Processing: pull metadata as a plain data frame, then pivot to long form ----------
+metadata_df <- seu@meta.data |>
+  as_tibble()
+
+qc_long <- metadata_df |>
+  select(cell_id, patient_id, tumor_subtype, nFeature_RNA, nCount_RNA, percent.mt) |>
+  pivot_longer(
+    cols = c(nFeature_RNA, nCount_RNA, percent.mt),
+    names_to = "metric",
+    values_to = "value"
+  ) |>
+  mutate(metric = factor(metric, levels = c("nFeature_RNA", "nCount_RNA", "percent.mt")))
+
+plot_qc_violins <- ggplot(qc_long, aes(x = patient_id, y = value, fill = tumor_subtype)) +
+  geom_violin(scale = "width", trim = TRUE) +
+  facet_wrap(~ metric, scales = "free_y", ncol = 1) +
+  labs(x = "Patient", y = "Value", fill = "Subtype") +
+  theme_bw(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Outputs ----------
+dir.create("write/figures", showWarnings = FALSE, recursive = TRUE)
+ggsave(
+  filename = "write/figures/01-qc-violins-per-patient.pdf",
+  plot = plot_qc_violins,
+  width = 16, height = 10, bg = "white"
+)
+```
+
+## Filtration thresholds
+
+-   **Strategy**: cohort-wide hard floors on `nFeature_RNA`, `nCount_RNA`, and `percent.mt`, simple, auditable, defensible in a ten-minute conversation.
+
+-   **Doublet detection**: deliberately deferred, any doublet cluster will declare itself during annotation in notebook 03.
+
+```{r}
+#| label: qc-filter
+
+# Libraries ----------
+library(Seurat)
+library(tidyverse)
+library(readr)
+
+# Inputs ----------
+seu <- read_rds("checkpoints/01-ep-seu.rds")
+
+# Processing: hard-floor QC flags on the metadata (row order == cell order in seu) ----------
+metadata_df <- seu@meta.data |>
+  as_tibble() |>
+  mutate(
+    keep = nFeature_RNA >= 200 &
+           nCount_RNA   >= 500 &
+           percent.mt   <= 20
+  )
+
+# Per-patient filtration summary ----------
+filter_summary <- metadata_df |>
+  group_by(patient_id, tumor_subtype) |>
+  summarise(
+    cells_before  = n(),
+    cells_kept    = sum(keep),
+    cells_dropped = cells_before - cells_kept,
+    pct_dropped   = round(100 * cells_dropped / cells_before, 1),
+    .groups = "drop"
+  ) |>
+  arrange(tumor_subtype, patient_id)
+
+write_csv(filter_summary, "write/tables/01-qc-filter-summary.csv")
+
+# Apply filter: logical vector aligns 1:1 with seu cells ----------
+seu_filtered <- seu[, metadata_df$keep]
+
+# Outputs ----------
+write_rds(seu_filtered, "checkpoints/01-ep-seu-filtered.rds")
+```
+
+| Metric | Lower cut | Upper cut | Justification |
+|------------------|------------------|------------------|--------------------|
+| `nFeature_RNA` | ≥200 (hard) + 3-MAD (per-patient) | — | Standard floor for 10x droplet data |
+| `nCount_RNA` | ≥500 (hard) + 3-MAD (per-patient) | — | Removes obvious empty droplets and very shallow cells |
+| `percent.mt` | — | ≤20 (hard) + 3-MAD (per-patient) | Conservative upper bound for fresh-tissue scRNA-seq |
+
+# Post-filter diagnostics
+
+-   **Per-patient cell yield** is the primary concern before integration, any patient retaining \< 50 cells gets flagged as a candidate for exclusion from CellChat downstream (CellChat communication probability becomes unreliable below \~20 cells per cell type per patient).
+-   **Re-plot the QC violins** on the filtered object as the sanity check that the filtration did what the summary table claims.
+
+```{r}
+#| label: post-filter-diagnostics
+#| fig-width: 14
+#| fig-height: 6
+
+# Libraries ----------
+library(Seurat)
+library(tidyverse)
+library(ggplot2)
+library(readr)
+
+# Inputs ----------
+seu_filtered <- read_rds("checkpoints/01-ep-seu-filtered.rds")
+
+# Processing ----------
+metadata_filtered <- seu_filtered@meta.data |>
+  as_tibble()
+
+cells_per_patient <- metadata_filtered |>
+  dplyr::count(patient_id, tumor_subtype, name = "n_cells") |>
+  arrange(tumor_subtype, n_cells)
+
+plot_cells_per_patient <- ggplot(
+  cells_per_patient,
+  aes(x = reorder(patient_id, n_cells), y = n_cells, fill = tumor_subtype)
+) +
+  geom_col() +
+  coord_flip() +
+  labs(x = "Patient", y = "Cells retained", fill = "Subtype") +
+  theme_bw(base_size = 11)
+
+# Outputs ----------
+ggsave(
+  filename = "write/figures/01-cells-per-patient-post-qc.pdf",
+  plot = plot_cells_per_patient,
+  width = 10, height = 8, bg = "white"
+)
+```
+
+# Next steps
+
+-   **Notebook 02** loads `01-ep-seu-filtered.rds` and performs `LogNormalize` → variable feature selection (top 2000) → PCA → Harmony on `patient_id` → UMAP → Louvain clustering (k=20), with a pre-vs-post integration UMAP as the integration-success figure required by the brief.

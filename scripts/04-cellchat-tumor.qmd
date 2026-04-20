@@ -1,0 +1,563 @@
+---
+title: "04. CellChat v2: Tumor-Focused Cell-Cell Communication"
+subtitle: "Who talks to the cancer cells, and what do they say?"
+author: "Badran Elshenawy"
+date: today
+format:
+  html:
+    theme: darkly
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    code-tools: true
+    embed-resources: true
+    self-contained: true
+    title-block-banner: true
+engine: knitr
+execute:
+  eval: false
+  warning: false
+  message: false
+---
+
+# Context
+
+-   **Role of this notebook**: the Pillar 2 deliverable, a CellChat v2 analysis of the integrated ependymoma cohort, centred on what signals reach the neoplastic cells and what the neoplastic cells send out in return.
+-   **Biological framing** (from Andrade et al. 2024, *Nat Commun*):
+    -   K27M H3-mutant paediatric gliomas are myeloid-infiltrated and lymphoid-depleted; their tumor cells receive dominant immunosuppressive signals (OSM–LIFR, LGALS9–CD47, MIF–CD74) and send minimal chemokine output.
+    -   Ependymoma is the paper's *comparator*, mixed myeloid/lymphoid, transcriptionally active TME. The prediction I want to test: ependymoma tumor cells should receive *chemokine* signals (CCL, CXCL) from myeloid populations and engage functional antigen-presentation pathways (HLA-I/II, CD40), rather than the K27M immunosuppressive axis.
+-   **What makes this tumor-focused**:
+    -   Aggregate interaction network colours every edge by weight, but the narrative pulls the rows and columns that involve tumor-state groups (`tumor_undifferentiated`, `tumor_transportive`, `tumor_ciliated`, `tumor_mesenchymal`, `tumor_cycling`).
+    -   Two bubble plots isolate **incoming** (non-tumor → tumor) and **outgoing** (tumor → non-tumor) L-R pairs.
+    -   Specific per-pathway chord plots are produced for the six axes the brief flags as biologically load-bearing: **OSM, LGALS9, MIF** (Andrade-present / ependymoma-expected-absent) and **CCL, CXCL, MHC-II** (Andrade-absent / ependymoma-expected-present).
+
+# Execution
+
+-   **This notebook is the spec, but it is not the executor.** The `computeCommunProb` step takes 20\~30 minutes on this cohort and it is cheaper to run it once from a shell than to tie up a Quarto session.
+-   **The code in each chunk below is mirrored in a matching `.R` runner** under `scripts/runners/` (the `runners/` directory is git-ignored, it contains local driver scripts, not part of the shared analysis). Every runner is wrapped in a `run_stage(name, {body})` helper from `scripts/runners/_helpers.R` that prints `START / END / elapsed` timestamps, catches errors without aborting the pipeline, and writes dual `.pdf` + `.png` outputs for every figure so the PNGs can be quickly inspected.
+-   **Driver**: `Rscript scripts/runners/04-run-all.R` runs the 12 stages in order (`04-01-build.R` through `04-12-export-tables.R`). A resume-from-preprocess driver (`04-run-from-preprocess.R`) skips the build step if a raw CellChat object already exists.
+-   **Stages** (each is one `.R` file under `scripts/runners/`):
+    -   `04-01-build.R`: load Seurat, `createCellChat(group.by = "cell_class")`, attach `CellChatDB.human`
+    -   `04-02-preprocess.R`: `subsetData` → `identifyOverExpressedGenes` → `identifyOverExpressedInteractions` (requires `presto` from `immunogenomics/presto`)
+    -   `04-03-inference.R`: `computeCommunProb(type = "triMean", nboot = 100)` → `filterCommunication(min.cells = 10)` → `computeCommunProbPathway` → `aggregateNet` → `netAnalysis_computeCentrality` (the expensive stage, parallelised with `future::plan("multisession", workers = 4)` and `options(future.globals.maxSize = 8 * 1024^3)`)
+    -   `04-04-agg-circle.R` / `04-05-agg-heatmap.R`: aggregate network visualisations
+    -   `04-06-rank-net.R`: information-flow ranking
+    -   `04-07-tumor-incoming.R` / `04-08-tumor-outgoing.R`: tumor-focused bubble plots
+    -   `04-09-andrade-pathways.R`: per-pathway chord plots for the six Andrade-contrast pathways (wrapped in defensive checks so missing pathways skip rather than error)
+    -   `04-10-role-scatter.R` / `04-11-role-heatmaps.R`: signalling-role analyses
+    -   `04-12-export-tables.R`: full L-R CSV exports
+
+# Pipeline parameters
+
+| Parameter | Value | Justification |
+|------------------|------------------|------------------------------------|
+| Database | `CellChatDB.human` | Per the brief, human ependymoma cohort |
+| Interaction types | Secreted Signalling, ECM-Receptor, Cell-Cell Contact | All three, per the brief |
+| Group variable | `cell_class` (12 levels after refactor in 03) | Collapses the 19 Gillen labels into CellChat-tractable groups |
+| Probability type | `triMean` | CellChat default; robust to outliers |
+| Permutations (`nboot`) | 100 | Standard v2 default; upper this to 1000 only if the significance mapping is unstable at n=100 |
+| `min.cells` filter | 10 | Per-group floor for communication probability estimation |
+
+# Checkpoint convention
+
+| Stage | File | Description |
+|------------------|------------------|------------------------------------|
+| Post-inference | `04-cellchat.rds` | CellChat object with `net`, `netP`, centrality computed |
+| Rankings | `write/tables/04-pathway-ranking.csv` | `rankNet()` output, pathways by information flow |
+| L-R significance | `write/tables/04-significant-LR-pairs.csv` | Filtered significant L-R pairs |
+
+# Setup
+
+## Define the tumor and non-tumor group vectors
+
+-   **Tumor cell groups** (used as targets/sources in the focused views): the four neoplastic states plus the cycling pool. Subtype-specific tumor subclusters (PFA-other, PFB, ST-RELA, ST-YAP) are included in the CellChat run but excluded from the tumor-focus views because they represent supratentorial / minor-PFA cells whose cell counts are low and heterogeneous.
+-   **Non-tumor groups**: immune myeloid, immune lymphoid, normal oligodendrocyte.
+
+```{r}
+#| label: groups
+
+# Libraries ----------
+library(tidyverse)
+
+# Processing ----------
+tumor_groups <- c(
+  "tumor_undifferentiated",
+  "tumor_transportive",
+  "tumor_ciliated",
+  "tumor_mesenchymal",
+  "tumor_cycling"
+)
+
+non_tumor_groups <- c(
+  "immune_myeloid",
+  "immune_lymphoid",
+  "normal_oligodendrocyte"
+)
+
+subtype_tumor_groups <- c(
+  "tumor_PFA_other", "tumor_PFB", "tumor_ST_RELA", "tumor_ST_YAP"
+)
+```
+
+# Build the CellChat object
+
+-   **Input**: the annotated Seurat object from notebook 03, with `cell_class` as the grouping variable.
+-   **Assay layer**: pass the log-normalised data (`data` layer). `createCellChat()` handles pulling it directly from a Seurat object given `group.by`.
+-   **Future strategy**: CellChat v2 uses `future` for parallelising the permutation step, same ceiling bump as in 02 keeps `computeCommunProb` from choking on the serialised object.
+
+```{r}
+#| label: build-cellchat
+
+# Libraries ----------
+library(Seurat)
+library(CellChat)
+library(tidyverse)
+library(readr)
+
+# Setup ----------
+options(future.globals.maxSize = 8 * 1024^3)
+future::plan("multisession", workers = 4)
+
+# Inputs ----------
+seu <- read_rds("checkpoints/03-ep-seu-annotated.rds")
+seu@meta.data
+# Processing ----------
+cellchat <- createCellChat(
+  object   = seu,
+  group.by = "cell_class",
+  assay    = "RNA"
+)
+
+# Attach the human CellChatDB, full (all three interaction types) ----------
+cellchat@DB <- CellChatDB.human
+
+# Outputs ----------
+write_rds(cellchat, "checkpoints/04-cellchat-raw.rds")
+```
+
+## Pre-processing, subset to DB genes, identify over-expressed L-R pairs
+
+-   **`subsetData()`**, subsets the expression matrix to genes in the database, reducing computational load.
+-   **`identifyOverExpressedGenes()`**, per-group DE test (Wilcoxon) with `thresh.p = 0.05` default.
+-   **`identifyOverExpressedInteractions()`**, filters L-R pairs where both partners are over-expressed in at least one sender-receiver pairing.
+
+```{r}
+#| label: cellchat-preprocess
+
+# Libraries ----------
+library(CellChat)
+library(readr)
+
+# Inputs ----------
+cellchat <- read_rds("checkpoints/04-cellchat-raw.rds")
+
+# Processing ----------
+cellchat <- subsetData(cellchat)
+cellchat <- identifyOverExpressedGenes(cellchat)
+cellchat <- identifyOverExpressedInteractions(cellchat)
+
+# Outputs ----------
+write_rds(cellchat, "checkpoints/04-cellchat-raw.rds")
+```
+
+# Communication probability inference
+
+-   **`computeCommunProb()`** is the core inference, mass-action-based communication probability per L-R pair per sender-receiver pair. `type = "triMean"` uses the 25/50/75 percentile trimean of group-level expression, robust to outliers.
+-   **`filterCommunication(min.cells = 10)`** drops interactions involving any group with fewer than 10 cells in the cell-type subset (none of my `cell_class` values should be that sparse post-refactor, but the filter is defensive).
+-   **`computeCommunProbPathway()`** aggregates L-R pair probabilities to signalling-pathway probabilities.
+-   **`aggregateNet()`** sums across all pathways to build the cell-type × cell-type network matrix shown in the aggregate circle plot.
+-   **Runtime warning**: this chunk is the expensive one, ~20–30 min on a laptop for \~50k cells × 12 groups × 100 permutations. Run once, checkpoint the result.
+
+```{r}
+#| label: cellchat-inference
+
+# Libraries ----------
+library(CellChat)
+library(readr)
+
+# Inputs ----------
+cellchat <- read_rds("checkpoints/04-cellchat-raw.rds")
+
+# Processing ----------
+cellchat <- computeCommunProb(
+  cellchat,
+  type            = "triMean",
+  raw.use         = TRUE,
+  population.size = FALSE,
+  nboot           = 100
+)
+cellchat <- filterCommunication(cellchat, min.cells = 10)
+cellchat <- computeCommunProbPathway(cellchat)
+cellchat <- aggregateNet(cellchat)
+
+# Centrality (sender/receiver/mediator/influencer scores per pathway) ----------
+cellchat <- netAnalysis_computeCentrality(cellchat, slot.name = "netP")
+
+# Outputs ----------
+write_rds(cellchat, "checkpoints/04-cellchat.rds")
+```
+
+# Aggregate communication network (Figure 3)
+
+-   **What it shows**: total interaction weight between every pair of `cell_class` groups. Each node is a cell class; edge thickness is aggregate communication probability across all pathways.
+-   **What to look for**: thick edges connecting `immune_myeloid` to the tumor states indicates the myeloid compartment is the dominant source of tumor-incoming signal. Reciprocal thick edges (tumor → immune) indicate tumor-driven immune recruitment.
+
+```{r}
+#| label: agg-network-circle
+#| fig-width: 10
+#| fig-height: 10
+
+# Libraries ----------
+library(CellChat)
+library(readr)
+
+# Inputs ----------
+cellchat <- read_rds("checkpoints/04-cellchat.rds")
+
+# Processing + Inspect ----------
+# netVisual_circle writes directly to the graphics device, open a PDF device,
+# render, close, so it both prints in the notebook (via knitr's image hook)
+# and saves to disk.
+groupSize <- as.numeric(table(cellchat@idents))
+
+pdf("write/figures/04-aggregate-communication-circle.pdf", width = 10, height = 10)
+par(mfrow = c(1, 2), xpd = TRUE)
+netVisual_circle(
+  cellchat@net$count,
+  vertex.weight = groupSize,
+  weight.scale  = TRUE,
+  label.edge    = FALSE,
+  title.name    = "Number of interactions"
+)
+netVisual_circle(
+  cellchat@net$weight,
+  vertex.weight = groupSize,
+  weight.scale  = TRUE,
+  label.edge    = FALSE,
+  title.name    = "Interaction weights / strength"
+)
+dev.off()
+```
+
+## Heatmap variant, easier to read at 12 cell classes
+
+```{r}
+#| label: agg-network-heatmap
+#| fig-width: 12
+#| fig-height: 8
+
+# Libraries ----------
+library(CellChat)
+library(readr)
+
+# Inputs ----------
+cellchat <- read_rds("checkpoints/04-cellchat.rds")
+
+# Processing ----------
+plot_net_heatmap_count  <- netVisual_heatmap(cellchat, measure = "count",  color.heatmap = "Blues")
+plot_net_heatmap_weight <- netVisual_heatmap(cellchat, measure = "weight", color.heatmap = "Reds")
+
+# Inspect ----------
+plot_net_heatmap_count + plot_net_heatmap_weight
+
+# Outputs ----------
+pdf("write/figures/04-aggregate-communication-heatmap.pdf", width = 12, height = 8)
+print(plot_net_heatmap_count + plot_net_heatmap_weight)
+dev.off()
+```
+
+# Information flow ranking (Figure 4)
+
+-   **`rankNet()`** orders signalling pathways by total information flow (sum of communication probabilities across all sender-receiver pairs).
+-   **What to look for**: chemokine pathways (CCL, CXCL) and antigen-presentation pathways (MHC-I, MHC-II) near the top of the ranking is the ependymoma-expected signature; if OSM, LGALS9, or MIF dominate, the K27M-like immunosuppressive axis is engaged instead.
+
+```{r}
+#| label: rank-net
+#| fig-width: 10
+#| fig-height: 12
+
+# Libraries ----------
+library(CellChat)
+library(tidyverse)
+library(readr)
+
+# Inputs ----------
+cellchat <- read_rds("checkpoints/04-cellchat.rds")
+
+# Processing ----------
+plot_rank <- rankNet(
+  cellchat,
+  mode         = "single",
+  measure      = "weight",
+  color.use    = NULL,
+  return.data  = FALSE,
+  do.stat      = TRUE
+) +
+  labs(title = "Signalling pathways ranked by information flow (weight)")
+
+# Extract the underlying ranking as a table for the report ----------
+rank_df <- rankNet(cellchat, mode = "single", measure = "weight", return.data = TRUE, do.stat = TRUE)$signaling.contribution
+
+# Inspect ----------
+plot_rank
+
+# Outputs ----------
+ggsave(
+  filename = "write/figures/04-pathway-ranking.pdf",
+  plot = plot_rank,
+  width = 10, height = 12, bg = "white",
+  device = cairo_pdf
+)
+write_csv(rank_df, "write/tables/04-pathway-ranking.csv")
+```
+
+# Tumor-incoming signals, who talks TO the cancer cells
+
+-   **Question**: for each tumor state, which `(source, L-R pair)` combinations are the significant senders?
+-   **`netVisual_bubble(sources.use = non_tumor_groups, targets.use = tumor_groups, remove.isolate = TRUE)`**, filters to sender = any non-tumor group, target = any tumor state. Bubble size is communication probability; colour is p-value (smaller = more significant).
+-   **Expected dominant axis for ependymoma**: myeloid-sourced chemokines (CCL3, CCL4, CXCL8) and MHC-II interactions landing on `tumor_mesenchymal` in particular, since MEC is the most mesenchymally activated state.
+
+```{r}
+#| label: tumor-incoming-bubble
+#| fig-width: 12
+#| fig-height: 14
+
+# Libraries ----------
+library(CellChat)
+library(readr)
+
+# Inputs ----------
+cellchat <- read_rds("checkpoints/04-cellchat.rds")
+
+# Processing ----------
+plot_incoming <- netVisual_bubble(
+  cellchat,
+  sources.use    = non_tumor_groups,
+  targets.use    = tumor_groups,
+  remove.isolate = TRUE,
+  angle.x        = 45,
+  title.name     = "Incoming tumor signals, non-tumor sources to tumor states"
+)
+
+# Inspect ----------
+plot_incoming
+
+# Outputs ----------
+ggsave(
+  filename = "write/figures/04-tumor-incoming-bubble.pdf",
+  plot = plot_incoming,
+  width = 12, height = 14, bg = "white",
+  device = cairo_pdf
+)
+
+# Also export the underlying significant interactions as a table ----------
+incoming_df <- subsetCommunication(
+  cellchat,
+  sources.use = non_tumor_groups,
+  targets.use = tumor_groups
+)
+write_csv(incoming_df, "write/tables/04-tumor-incoming-significant-LR.csv")
+```
+
+# Tumor-outgoing signals, what the cancer cells send out
+
+-   **Question**: for each tumor state, what ligand-receptor pairs mediate signalling to non-tumor populations?
+-   **Biological interpretation axis**:
+    -   Tumor → myeloid: does ependymoma tumour recruit or polarise myeloid cells? In K27M the answer is yes via immunosuppressive signals; in ependymoma it should be yes via chemokine / inflammatory signals.
+    -   Tumor → lymphoid: this is the ependymoma-specific axis Andrade flags as absent in K27M. Expect CCL/CXCL chemokine signalling and possibly MHC-I presentation.
+
+```{r}
+#| label: tumor-outgoing-bubble
+#| fig-width: 12
+#| fig-height: 14
+
+# Libraries ----------
+library(CellChat)
+library(readr)
+
+# Inputs ----------
+cellchat <- read_rds("checkpoints/04-cellchat.rds")
+
+# Processing ----------
+plot_outgoing <- netVisual_bubble(
+  cellchat,
+  sources.use    = tumor_groups,
+  targets.use    = non_tumor_groups,
+  remove.isolate = TRUE,
+  angle.x        = 45,
+  title.name     = "Outgoing tumor signals, tumor states to non-tumor targets"
+)
+
+# Inspect ----------
+plot_outgoing
+
+# Outputs ----------
+ggsave(
+  filename = "write/figures/04-tumor-outgoing-bubble.pdf",
+  plot = plot_outgoing,
+  width = 12, height = 14, bg = "white",
+  device = cairo_pdf
+)
+
+outgoing_df <- subsetCommunication(
+  cellchat,
+  sources.use = tumor_groups,
+  targets.use = non_tumor_groups
+)
+write_csv(outgoing_df, "write/tables/04-tumor-outgoing-significant-LR.csv")
+```
+
+# Andrade-contrast pathway-level views
+
+-   **Why these six pathways**: the brief flags them as the load-bearing axes for the K27M-vs-ependymoma contrast. Half are expected *present* in K27M / *absent* in ependymoma (immunosuppressive); half are expected *absent* in K27M / *present* in ependymoma (chemokine / antigen-presentation).
+-   **Per-pathway chord plot** for each: shows which cell-class pairs carry the signal, with tumor states highlighted.
+-   **Robustness**: wrap each call in `tryCatch()`: pathways that didn't pass the over-expression filter will be absent from `cellchat@netP$pathways`, and the chord function errors on missing pathways. `tryCatch` turns the error into an informative NA and continues.
+
+```{r}
+#| label: andrade-contrast-pathways
+#| fig-width: 10
+#| fig-height: 10
+
+# Libraries ----------
+library(CellChat)
+library(readr)
+
+# Inputs ----------
+cellchat <- read_rds("checkpoints/04-cellchat.rds")
+
+# Processing ----------
+andrade_contrast_pathways <- list(
+  immunosuppressive = c("OSM", "GALECTIN", "MIF"),
+  active_immune     = c("CCL",  "CXCL",     "MHC-II")
+)
+
+save_pathway_chord <- function(pathway, filename_prefix) {
+  if (!pathway %in% cellchat@netP$pathways) {
+    message("Pathway ", pathway, " not in netP, skipping.")
+    return(invisible(NULL))
+  }
+  pdf(paste0("write/figures/04-pathway-", filename_prefix, "-", pathway, ".pdf"),
+      width = 10, height = 10)
+  par(mfrow = c(1, 1), xpd = TRUE)
+  netVisual_aggregate(
+    cellchat,
+    signaling = pathway,
+    layout    = "chord"
+  )
+  dev.off()
+}
+
+for (p in andrade_contrast_pathways$immunosuppressive) {
+  save_pathway_chord(p, "immunosuppressive")
+}
+for (p in andrade_contrast_pathways$active_immune) {
+  save_pathway_chord(p, "active-immune")
+}
+
+# Also save a pathway-presence table for the report ----------
+pathway_presence <- tibble::tibble(
+  pathway     = c(andrade_contrast_pathways$immunosuppressive,
+                  andrade_contrast_pathways$active_immune),
+  axis        = c(rep("immunosuppressive", 3), rep("active_immune", 3)),
+  in_netP     = pathway %in% cellchat@netP$pathways
+)
+write_csv(pathway_presence, "write/tables/04-andrade-contrast-pathway-presence.csv")
+```
+
+# Signalling role analysis, who sends, who receives, who mediates
+
+-   **`netAnalysis_signalingRole_scatter()`**, x-axis outgoing strength, y-axis incoming strength, per cell class, averaged across all pathways. Tumor states in the upper-right = both sending and receiving heavily; upper-left = receiving but not sending (passive); lower-right = sending but not receiving (active signal source).
+-   **`netAnalysis_signalingRole_heatmap(pattern = "outgoing" / "incoming")`**, per-pathway heatmap of who dominates outgoing / incoming signalling for each pathway.
+
+```{r}
+#| label: signalling-role-scatter
+#| fig-width: 8
+#| fig-height: 8
+
+# Libraries ----------
+library(CellChat)
+library(readr)
+
+# Inputs ----------
+cellchat <- read_rds("checkpoints/04-cellchat.rds")
+
+# Processing ----------
+plot_role_scatter <- netAnalysis_signalingRole_scatter(cellchat)
+
+# Inspect ----------
+plot_role_scatter
+
+# Outputs ----------
+ggsave(
+  filename = "write/figures/04-signalling-role-scatter.pdf",
+  plot = plot_role_scatter,
+  width = 8, height = 8, bg = "white",
+  device = cairo_pdf
+)
+```
+
+```{r}
+#| label: signalling-role-heatmaps
+#| fig-width: 14
+#| fig-height: 14
+
+# Libraries ----------
+library(CellChat)
+library(readr)
+
+# Inputs ----------
+cellchat <- read_rds("checkpoints/04-cellchat.rds")
+
+# Processing ----------
+plot_outgoing_heat <- netAnalysis_signalingRole_heatmap(
+  cellchat,
+  pattern     = "outgoing",
+  color.heatmap = "Reds",
+  width = 6, height = 14
+)
+
+plot_incoming_heat <- netAnalysis_signalingRole_heatmap(
+  cellchat,
+  pattern     = "incoming",
+  color.heatmap = "Blues",
+  width = 6, height = 14
+)
+
+# Outputs ----------
+pdf("write/figures/04-signalling-role-heatmaps.pdf", width = 14, height = 14)
+print(plot_outgoing_heat + plot_incoming_heat)
+dev.off()
+```
+
+# Export significant interactions, all, not just tumor
+
+-   **Purpose**: a clean CSV with every significant L-R interaction across the cohort, for quick grepping / cross-referencing in the report.
+
+```{r}
+#| label: export-all-significant
+
+# Libraries ----------
+library(CellChat)
+library(tidyverse)
+library(readr)
+
+# Inputs ----------
+cellchat <- read_rds("checkpoints/04-cellchat.rds")
+
+# Processing ----------
+all_significant <- subsetCommunication(cellchat)
+
+# Summary by pathway ----------
+pathway_summary <- all_significant |>
+  dplyr::count(pathway_name, name = "n_LR_pairs") |>
+  arrange(desc(n_LR_pairs))
+
+# Outputs ----------
+write_csv(all_significant, "write/tables/04-significant-LR-pairs.csv")
+write_csv(pathway_summary, "write/tables/04-pathway-LR-count-summary.csv")
+```
+
+# Next steps
+
+-   **Notebook 05** loads `03-ep-seu-annotated.rds`, subsets to the myeloid compartment (`cell_class == "immune_myeloid"`), and runs `escape::runEscape()` for single-cell ssGSEA against the MSigDB Hallmark collection. The Hallmark NES heatmap is the Pillar 3 deliverable, the K27M-vs-ependymoma myeloid comparison that complements the CellChat story.
+-   **Biological report**: see `write/reports/04-cellchat-biological-interpretation.md`, the narrative report on the CellChat findings, structured around the Andrade contrast. Fill in specific numbers from the generated figures and tables once this notebook has run end-to-end.

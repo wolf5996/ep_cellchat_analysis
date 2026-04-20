@@ -1,0 +1,345 @@
+---
+title: "03. Cell-type Refactoring and ShinyCell2 App"
+subtitle: "Readable cell categories + interactive browser"
+author: "Badran Elshenawy"
+date: today
+format:
+  html:
+    theme: darkly
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    code-tools: true
+    embed-resources: true
+    self-contained: true
+    title-block-banner: true
+engine: knitr
+execute:
+  eval: false
+  warning: false
+  message: false
+---
+
+# Context
+
+-   **Role of this notebook**: collapse the 19 shipped Gillen `cell_type` labels into a smaller, interpretable `cell_class` column, then build a ShinyCell2 app so the integrated object can be browsed by anyone without an R session.
+-   **Why refactor rather than re-annotate**: the Gillen labels are already marker-validated (see Cell Rep 2020, Fig. 2). The problem isn't the biology. It's that the 19-level mixture of lineage states (UEC/TEC/CEC/MEC) and molecular-subtype subclusters (PFA-sc*, RELA-sc*, YAP) is too granular for CellChat in notebook 04. CellChat loses statistical power with many sparse categories; I want 8\~10 groups with enough cells each.
+-   **Design goal for `cell_class`**:
+    -   Non-tumor stroma gets its own categories (myeloid, lymphoid, oligodendrocytes)
+    -   The four neoplastic *states* (UEC/TEC/CEC/MEC) remain distinct; this is the axis the paper's prognosis argument rests on
+    -   The molecular-subtype-specific subclusters collapse to their subgroup of origin (PFA-other, PFB, ST-RELA, ST-YAP). These represent supratentorial or minor-PFA tumor cells, not cell states
+    -   Doublets are flagged and removed before downstream analysis
+-   **ShinyCell2 deliverable**: a self-contained Shiny app that lets Manav (or anyone) explore the integrated cohort by gene and metadata on both the Harmony and unintegrated UMAPs. Lightweight to host, easy to share.
+
+# Label refactoring strategy
+
+## The full Gillen label set and how it maps
+
+-   **Non-tumor (3 labels → 3 classes)**:
+    -   `Myeloid` → `immune_myeloid`: microglia, macrophages, monocytes all pooled here (sub-clustering is deferred to notebook 04's CellChat run, which treats `immune_myeloid` as one category unless sufficient cells exist to split)
+    -   `Lymphocytes` → `immune_lymphoid`. T / B / NK pooled
+    -   `Oligodendrocytes` → `normal_oligodendrocyte`: non-tumor brain
+-   **Neoplastic cell states (5 labels → 5 classes)**, the Fig. 2 axis:
+    -   `UEC-1`, `UEC-2` → `tumor_undifferentiated`: progenitor-like, stem apex
+    -   `TEC` → `tumor_transportive`: intermediate state, transporter-enriched
+    -   `CEC` → `tumor_ciliated`: differentiated ependyma-like (good prognosis)
+    -   `MEC` → `tumor_mesenchymal`: hypoxia-driven (bad prognosis)
+    -   `mitotic` → `tumor_cycling`: cell-cycle-dominant cluster, any lineage
+-   **Subtype-specific tumor subclusters (9 labels → 4 classes)**:
+    -   `PFA-sc6`, `PFA-sc7` → `tumor_PFA_other`: small PFA subsets that didn't fit the 4-state scheme
+    -   `PFB` → `tumor_PFB`: posterior fossa group B (1 patient in this cohort)
+    -   `RELA-sc1` … `RELA-sc5` → `tumor_ST_RELA`: supratentorial RELA-fusion
+    -   `YAP` → `tumor_ST_YAP`: supratentorial YAP1-fusion
+-   **Artefact (1 label)**:
+    -   `Doublets` → `artefact_doublet`: flagged here, excluded at the next chunk
+
+# Apply the refactor
+
+-   **Strategy**: single `case_when()` block on the metadata tibble, then write the result back onto the Seurat object as `seu$cell_class`.
+-   **Sanity**: assert that every cell has a non-NA `cell_class`; if any slip through, the `case_when` is incomplete and should fail loud.
+
+```{r}
+#| label: refactor-cell-class
+
+# Libraries ----------
+library(Seurat)
+library(tidyverse)
+library(readr)
+
+# Inputs ----------
+seu <- read_rds("checkpoints/02-ep-seu-integrated.rds")
+
+# Processing ----------
+cell_class_map <- seu@meta.data |>
+  mutate(
+    cell_class = case_when(
+      # Non-tumor
+      cell_type == "Myeloid"            ~ "immune_myeloid",
+      cell_type == "Lymphocytes"        ~ "immune_lymphoid",
+      cell_type == "Oligodendrocytes"   ~ "normal_oligodendrocyte",
+      # Neoplastic cell states
+      cell_type %in% c("UEC-1", "UEC-2") ~ "tumor_undifferentiated",
+      cell_type == "TEC"                 ~ "tumor_transportive",
+      cell_type == "CEC"                 ~ "tumor_ciliated",
+      cell_type == "MEC"                 ~ "tumor_mesenchymal",
+      cell_type == "mitotic"             ~ "tumor_cycling",
+      # Subtype-specific tumor subclusters
+      cell_type %in% c("PFA-sc6", "PFA-sc7") ~ "tumor_PFA_other",
+      cell_type == "PFB"                     ~ "tumor_PFB",
+      str_starts(cell_type, "RELA-sc")       ~ "tumor_ST_RELA",
+      cell_type == "YAP"                     ~ "tumor_ST_YAP",
+      # Artefact
+      cell_type == "Doublets"           ~ "artefact_doublet",
+      TRUE                              ~ NA_character_
+    )
+  ) |>
+  select(cell_id, cell_class)
+
+# Sanity: every cell maps to something ----------
+stopifnot(!any(is.na(cell_class_map$cell_class)))
+
+# Write back onto the Seurat object (row order of metadata = cell order of seu) ----------
+seu$cell_class <- cell_class_map$cell_class[match(colnames(seu), cell_class_map$cell_id)]
+
+# Outputs ----------
+write_rds(seu, "checkpoints/03-ep-seu-annotated.rds")
+```
+
+## Refactor summary table
+
+-   **Purpose**: save a per-class cell count so the refactor is documented and the downstream CellChat run (notebook 04) has a reference for `min.cells` threshold decisions.
+
+```{r}
+#| label: refactor-summary
+
+# Libraries ----------
+library(Seurat)
+library(tidyverse)
+library(readr)
+
+# Inputs ----------
+seu <- read_rds("checkpoints/03-ep-seu-annotated.rds")
+
+# Processing ----------
+cell_class_summary <- seu@meta.data |>
+  as_tibble() |>
+  dplyr::count(cell_class, name = "n_cells") |>
+  mutate(pct = round(100 * n_cells / sum(n_cells), 2)) |>
+  arrange(desc(n_cells))
+
+# Inspect ----------
+cell_class_summary
+
+# Outputs ----------
+write_csv(cell_class_summary, "write/tables/03-cell-class-summary.csv")
+```
+
+# Drop doublets
+
+-   **Why here, not in 01**: doublet detection wasn't done formally in QC, I flagged Gillen's `Doublets` label downstream so they'd survive integration for sanity (it's useful to see where the shipped doublet cluster lands on the Harmony UMAP).
+-   **Action**: drop `artefact_doublet` cells before building the Shiny app or running CellChat. Save the cleaned object as the working checkpoint for everything downstream.
+
+```{r}
+#| label: drop-doublets
+
+# Libraries ----------
+library(Seurat)
+library(readr)
+
+# Inputs ----------
+seu <- read_rds("checkpoints/03-ep-seu-annotated.rds")
+
+# Processing ----------
+cells_keep <- colnames(seu)[seu$cell_class != "artefact_doublet"]
+seu <- seu[, cells_keep]
+
+# Outputs ----------
+write_rds(seu, "checkpoints/03-ep-seu-annotated.rds")
+```
+
+# Inline UMAP check, new cell_class labels on the Harmony embedding
+
+-   **Purpose**: eyeball the refactor. Tumor states should be spatially coherent on the Harmony UMAP; the PFA-other, PFB, ST-RELA, ST-YAP classes should sit with the other tumor clusters but offset by their molecular subtype.
+
+```{r}
+#| label: umap-cell-class
+#| fig-width: 10
+#| fig-height: 8
+
+# Libraries ----------
+library(Seurat)
+library(BadranSeq)
+library(readr)
+
+# Inputs ----------
+seu <- read_rds("checkpoints/03-ep-seu-annotated.rds")
+
+# Processing ----------
+plot_cell_class <- do_DimPlot(
+  seu,
+  reduction = "umap.harmony",
+  group.by = "cell_class"
+) +
+  labs(title = "Harmony UMAP coloured by refactored cell_class")
+
+# Inspect ----------
+plot_cell_class
+
+# Outputs ----------
+ggsave(
+  filename = "write/figures/03-umap-cell-class.pdf",
+  plot = plot_cell_class,
+  width = 10, height = 10, bg = "white"
+)
+```
+
+# ShinyCell2 app
+
+## Why ShinyCell2
+
+-   **Purpose**: Manav (and anyone he forwards this to) can explore the full integrated object in a browser, gene expression, cell-type labels, cluster membership, all UMAPs, without needing R or the `.rds` file.
+-   **Deliverable form**: a self-contained `shinyApp/` directory that runs with `shiny::runApp("write/apps/ep-cellchat-shinyapp")`. The directory can be zipped and shared, or deployed to shinyapps.io.
+
+## Build the config
+
+-   **Start from the raw config**, then trim metadata clutter (QC columns, the raw `cell_type` column which is superseded by `cell_class`), rename what survives for readability, and pick a sensible default for colouring.
+-   **`cell_class`** is the default grouping variable; **`tumor_subtype`** is the natural secondary one.
+-   **Colours** are assigned manually for `cell_class` so tumor states get a warm palette and non-tumor compartments get cool colours, readable at a glance.
+
+```{r}
+#| label: shinycell-config
+
+# Libraries ----------
+library(Seurat)
+library(ShinyCell2)
+library(RColorBrewer)
+library(readr)
+
+# Inputs ----------
+seu <- read_rds("checkpoints/03-ep-seu-annotated.rds")
+
+# Processing: build the base config from the Seurat object ----------
+# Expose every metadata column, nothing is trimmed here. The app will surface
+# QC metrics, paper-supplied UMAP coords, Louvain seeds, and everything else
+# alongside the refactored `cell_class`.
+sc_config <- createConfig(seu)
+
+# Inspect what ShinyCell2 auto-detected ----------
+showLegend(sc_config)
+
+# Rename the columns I know about so they display nicely in the app UI.
+# Columns not listed here keep their raw R names in the app.
+sc_config <- modMetaName(
+  sc_config,
+  meta.to.mod = c("nCount_RNA", "nFeature_RNA", "percent.mt", "percent.ribo",
+                  "patient_id", "tumor_subtype", "location", "cell_type",
+                  "clusters.harmony", "cell_class"),
+  new.name    = c("UMI count", "Gene count", "% mitochondrial", "% ribosomal",
+                  "Patient", "Tumor subtype", "Anatomical location", "Author label (Gillen)",
+                  "Cluster (Harmony)", "Cell class")
+)
+
+# Custom colour palettes ----------
+# Tumor states: warm (oranges/reds) to flag neoplastic biology at a glance.
+# Immune: cool blues. Oligodendrocytes: green. Tumor-other: greys for deprioritisation.
+class_levels  <- sort(unique(seu$cell_class))
+class_palette <- c(
+  immune_myeloid           = "#1F77B4",
+  immune_lymphoid          = "#17BECF",
+  normal_oligodendrocyte   = "#2CA02C",
+  tumor_undifferentiated   = "#D62728",
+  tumor_transportive       = "#FF7F0E",
+  tumor_ciliated           = "#8C564B",
+  tumor_mesenchymal        = "#E377C2",
+  tumor_cycling            = "#BCBD22",
+  tumor_PFA_other          = "#7F7F7F",
+  tumor_PFB                = "#9467BD",
+  tumor_ST_RELA            = "#AEC7E8",
+  tumor_ST_YAP             = "#FFBB78"
+)[class_levels]
+
+sc_config <- modColours(
+  sc_config,
+  meta.to.mod = "Cell class",
+  new.colours = unname(class_palette)
+)
+
+# Subtype palette (5 levels): ColorBrewer Dark2 ----------
+sc_config <- modColours(
+  sc_config,
+  meta.to.mod = "Tumor subtype",
+  new.colours = brewer.pal(5, "Dark2")
+)
+
+# Pick default primary / secondary metadata for the app ----------
+sc_config <- modDefault(sc_config, "Cell class", "Tumor subtype")
+
+# Validate against the Seurat object ----------
+checkConfig(sc_config, seu)
+
+# Outputs: persist the config for reproducibility ----------
+write_rds(sc_config, "checkpoints/03-shinycell-config.rds")
+```
+
+## Build the Shiny app files
+
+-   **`dimred.to.use`**, passes both UMAPs so users can toggle in the app.
+-   **`default.gene1` / `default.gene2`**, seeded with biologically meaningful markers (`CSF1R` for myeloid, `CD3D` for T cells) so first-time users see something informative immediately.
+-   **`shiny.prefix`**, `sc1` is the ShinyCell2 convention (supports hosting multiple datasets in one app).
+-   **`shiny.dir`**, the app directory ends up at `write/apps/ep-cellchat-shinyapp/`.
+
+```{r}
+#| label: shinycell-build
+
+# Libraries ----------
+library(Seurat)
+library(ShinyCell2)
+library(readr)
+
+# Inputs ----------
+seu       <- read_rds("checkpoints/03-ep-seu-annotated.rds")
+sc_config <- read_rds("checkpoints/03-shinycell-config.rds")
+
+# Setup ----------
+shiny_dir <- "write/apps/ep-cellchat-shinyapp"
+dir.create(shiny_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Processing: serialise expression + embeddings + metadata to disk ----------
+makeShinyFiles(
+  seu, sc_config,
+  shiny.prefix     = "sc1",
+  shiny.dir        = shiny_dir,
+  dimred.to.use    = c("umap.harmony", "umap.unintegrated"),
+  default.gene1    = "CSF1R",
+  default.gene2    = "CD3D",
+  default.multigene = c("CSF1R", "CX3CR1", "P2RY12", "CD68", "CD163",
+                        "CD3D", "CD8A", "GFAP", "OLIG2"),
+  default.dimred   = "umap.harmony"
+)
+
+# Generate the Shiny UI + server code ----------
+makeShinyCodes(
+  shiny.title    = "Ependymoma scRNA-seq (GSE125969). Harmony-integrated cohort",
+  shiny.prefix   = "sc1",
+  shiny.dir      = shiny_dir,
+  shiny.footnotes = "Re-analysis of Gillen et al. 2020 (Cell Reports) by Badran Elshenawy, 2026."
+)
+```
+
+## Run the app locally
+
+-   **One command**: `shiny::runApp("write/apps/ep-cellchat-shinyapp")`. Opens in the default browser.
+-   **Ship it**: `zip -r ep-shinyapp.zip write/apps/ep-cellchat-shinyapp` produces a shareable archive.
+-   **Deploy to shinyapps.io**: `rsconnect::deployApp("write/apps/ep-cellchat-shinyapp")` (requires a shinyapps.io account and `rsconnect::setAccountInfo(...)` configured).
+
+```{r}
+#| label: shinycell-run
+#| eval: false
+
+# Run locally, this chunk is intentionally left eval=false to avoid blocking the knit.
+shiny::runApp("write/apps/ep-cellchat-shinyapp")
+```
+
+# Next steps
+
+-   **Notebook 04** loads `03-ep-seu-annotated.rds` and builds a CellChat v2 analysis centred on tumor-cell communication: which non-tumor populations signal *into* the tumor states, which tumor states signal *out* to the immune compartment, and which ligand-receptor axes carry the contrast against the Andrade 2024 K27M findings (OSM-LIFR, LGALS9-CD47, MIF-CD74 immunosuppressive vs. CCL/CXCL chemokine-active).

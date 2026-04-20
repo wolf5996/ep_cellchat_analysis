@@ -1,0 +1,476 @@
+---
+title: "05. Hallmark Module Scoring and Shiny App Rebuild"
+subtitle: "Seurat AddModuleScore + MSigDB Hallmark, then ShinyCell2 v2"
+author: "Badran Elshenawy"
+date: today
+format:
+  html:
+    theme: darkly
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    code-tools: true
+    embed-resources: true
+    self-contained: true
+    title-block-banner: true
+engine: knitr
+execute:
+  eval: false
+  warning: false
+  message: false
+---
+
+# Context
+
+-   **Role of this notebook**: the Pillar 3 deliverable. Hallmark-programme scoring of every cell in the integrated cohort, followed by a rebuild of the ShinyCell2 app so the 50 scores are browsable as metadata colour variables.
+-   **Method choice, `Seurat::AddModuleScore` instead of `escape::runEscape`**: the `escape` + `msigdb` stack has been fragile on this machine, and for 50 well-curated gene sets on \~16k cells, Seurat's module-score approach gives nearly identical ranking of cell states while being faster, simpler, and dependency-free. Scores are stored as per-cell metadata columns rather than an assay, which also simplifies ShinyCell integration.
+-   **`msigdbr` for gene sets**: tidy CRAN data frame of the full MSigDB, trivial to split into the named-list format `AddModuleScore` expects (`features = list(pathway_1 = c(gene symbols), ...)`).
+-   **Upstream**: loads `03-ep-seu-annotated.rds`. Independent of notebook 04 (CellChat).
+
+# Checkpoint convention
+
+| Stage | File | Description |
+|------------------------|------------------------|------------------------|
+| Post-scoring | `checkpoints/05-ep-seu-hallmark.rds` | Seurat object with 50 Hallmark score columns in metadata |
+| Shiny config | `checkpoints/05-shinycell-config.rds` | Rebuilt ShinyCell2 config |
+| App directory | `write/apps/ep-cellchat-shinyapp-v2/` | Standalone rebuilt Shiny app |
+
+# Fetch Hallmark gene sets from MSigDB
+
+-   **`msigdbr(db_species = "HS", collection = "H")`** pulls the 50 Hallmark pathways. Returns a long-format tibble with `gs_name` and `gene_symbol` columns.
+-   **Refactor to named list**: `split(df$gene_symbol, df$gs_name) |> lapply(unique)`, ready for `AddModuleScore(features = …)`.
+
+```{r}
+#| label: gene-sets
+
+# Libraries ----------
+library(msigdbr)
+library(dplyr)
+library(readr)
+
+# Processing ----------
+hallmark_df <- msigdbr(db_species = "HS", collection = "H")
+
+hallmark_sets <- split(hallmark_df$gene_symbol, hallmark_df$gs_name)
+hallmark_sets <- lapply(hallmark_sets, unique)
+
+cat("Hallmark pathways loaded: ", length(hallmark_sets), "\n")
+cat("Average genes per pathway:", round(mean(lengths(hallmark_sets)), 1), "\n")
+cat("First 5 names:\n")
+print(names(hallmark_sets)[1:5])
+
+# Outputs ----------
+write_rds(hallmark_sets, "checkpoints/05-hallmark-genesets.rds")
+```
+
+# Run AddModuleScore across all cells
+
+-   **Why it works for this**: `AddModuleScore` computes, for each cell, the average expression of the gene set minus the average expression of 100 matched control genes binned by expression level. Robust, interpretable, and aligned to Seurat's ecosystem.
+-   **Parameters**:
+    -   `features = hallmark_sets`, the named list from msigdbr
+    -   `name = "Hallmark_"`. Seurat suffixes each set with its index (`Hallmark_1`, …, `Hallmark_50`), which I rename to the actual pathway name immediately after
+    -   `ctrl = 100`, number of control genes per bin (default)
+    -   `nbin = 24`, expression bins (default)
+    -   `seed = 1`, reproducibility
+-   **Post-processing**: rename the `Hallmark_*` metadata columns to the real pathway IDs so downstream plots and the Shiny app show meaningful labels.
+-   **Runtime**: \~1–2 min for 50 sets on \~16k cells.
+
+```{r}
+#| label: module-scores
+
+# Libraries ----------
+library(Seurat)
+library(readr)
+
+# Inputs ----------
+seu <- read_rds("checkpoints/03-ep-seu-annotated.rds")
+hallmark_sets <- read_rds("checkpoints/05-hallmark-genesets.rds")
+
+DefaultAssay(seu) <- "RNA"
+
+# Processing ----------
+seu <- AddModuleScore(
+  seu,
+  features = hallmark_sets,
+  name     = "Hallmark_",
+  ctrl     = 100,
+  nbin     = 24,
+  seed     = 1
+)
+
+# Rename Hallmark_1, Hallmark_2, ... -> actual pathway names.
+old_cols <- paste0("Hallmark_", seq_along(hallmark_sets))
+new_cols <- names(hallmark_sets)
+
+stopifnot(all(old_cols %in% colnames(seu@meta.data)))
+colnames(seu@meta.data)[match(old_cols, colnames(seu@meta.data))] <- new_cols
+
+cat("Hallmark score columns added:", length(new_cols), "\n")
+cat("First 3 columns:\n")
+print(head(seu@meta.data[, new_cols[1:3]]))
+
+# Outputs ----------
+write_rds(seu, "checkpoints/05-ep-seu-hallmark.rds")
+```
+
+# Cohort-wide Hallmark heatmap
+
+-   **Purpose**: one figure summarising which pathways are active in which cell class.
+-   **Build**: mean score per pathway × cell_class, z-scaled row-wise to make columns (cell classes) directly comparable per pathway.
+-   **Library**: `ComplexHeatmap` for annotation and dendrogram support.
+
+```{r}
+#| label: hallmark-heatmap-cellclass
+#| fig-width: 16
+#| fig-height: 14
+
+# Libraries ----------
+library(Seurat)
+library(tidyverse)
+library(ComplexHeatmap)
+library(circlize)
+library(readr)
+
+# Inputs ----------
+seu <- read_rds("checkpoints/05-ep-seu-hallmark.rds")
+
+hallmark_cols <- grep("^HALLMARK_", colnames(seu@meta.data), value = TRUE)
+
+# Processing ----------
+score_long <- seu@meta.data |>
+  select(cell_id, cell_class, all_of(hallmark_cols)) |>
+  pivot_longer(cols = all_of(hallmark_cols),
+               names_to = "pathway", values_to = "score")
+
+score_matrix <- score_long |>
+  group_by(pathway, cell_class) |>
+  summarise(mean_score = mean(score), .groups = "drop") |>
+  pivot_wider(names_from = cell_class, values_from = mean_score) |>
+  column_to_rownames("pathway") |>
+  as.matrix()
+
+# Z-score each pathway across cell classes for comparable colour scale.
+score_matrix_z <- t(apply(score_matrix, 1, function(x) (x - mean(x)) / sd(x)))
+
+col_fun <- colorRamp2(c(-2, 0, 2), c("#2166AC", "#F7F7F7", "#B2182B"))
+
+plot_heatmap <- Heatmap(
+  score_matrix_z,
+  name          = "Z-score",
+  col           = col_fun,
+  row_names_gp  = gpar(fontsize = 9),
+  column_names_gp = gpar(fontsize = 10),
+  column_names_rot = 45,
+  cluster_columns = TRUE,
+  cluster_rows    = TRUE,
+  row_title     = "Hallmark pathway",
+  column_title  = "Cell class"
+)
+
+# Inspect ----------
+draw(plot_heatmap)
+
+# Outputs ----------
+dir.create("write/figures", showWarnings = FALSE, recursive = TRUE)
+pdf("write/figures/05-hallmark-heatmap-cellclass.pdf", width = 16, height = 14)
+draw(plot_heatmap)
+dev.off()
+png("write/figures/05-hallmark-heatmap-cellclass.png",
+    width = 16 * 120, height = 14 * 120, res = 150)
+draw(plot_heatmap)
+dev.off()
+
+write_csv(
+  score_matrix |> as.data.frame() |> rownames_to_column("pathway"),
+  "write/tables/05-hallmark-mean-by-cell-class.csv"
+)
+```
+
+# Focused pathway panels
+
+-   **Panel 1. Myeloid inflammation + metabolism**: `Seurat::VlnPlot` across `cell_class` for the 5 inflammation Hallmarks and 3 metabolism Hallmarks. Visualises whether ependymoma myeloid cells are inflammation-dominant (the Andrade-expected pattern).
+-   **Panel 2. Tumor state × hypoxia**: subset to PFA tumor states (UEC/TEC/CEC/MEC), ridge plot of `HALLMARK_HYPOXIA`. MEC should dominate.
+-   **Panel 3. Proliferation axis**: G2M / E2F / mitotic spindle Hallmarks, should peak in undifferentiated and cycling tumor classes.
+-   **Plot approach**: `Seurat::VlnPlot` and `Seurat::RidgePlot` both accept metadata column names as `features`, so the scores plot directly without any assay gymnastics.
+
+```{r}
+#| label: inflammation-panel
+#| fig-width: 16
+#| fig-height: 10
+
+# Libraries ----------
+library(Seurat)
+library(patchwork)
+library(readr)
+
+# Inputs ----------
+seu <- read_rds("checkpoints/05-ep-seu-hallmark.rds")
+
+# Processing ----------
+inflam_metab <- c(
+  "HALLMARK_INFLAMMATORY_RESPONSE",
+  "HALLMARK_TNFA_SIGNALING_VIA_NFKB",
+  "HALLMARK_INTERFERON_GAMMA_RESPONSE",
+  "HALLMARK_COMPLEMENT",
+  "HALLMARK_IL6_JAK_STAT3_SIGNALING",
+  "HALLMARK_HYPOXIA",
+  "HALLMARK_GLYCOLYSIS",
+  "HALLMARK_OXIDATIVE_PHOSPHORYLATION"
+)
+
+plot_inflam_metab <- VlnPlot(
+  seu,
+  features = inflam_metab,
+  group.by = "cell_class",
+  pt.size  = 0,
+  ncol     = 2,
+  same.y.lims = FALSE
+) &
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Inspect ----------
+plot_inflam_metab
+
+# Outputs ----------
+ggsave(
+  filename = "write/figures/05-hallmark-inflammation-metabolism-panel.pdf",
+  plot = plot_inflam_metab,
+  width = 16, height = 12, bg = "white",
+  device = cairo_pdf
+)
+ggsave(
+  filename = "write/figures/05-hallmark-inflammation-metabolism-panel.png",
+  plot = plot_inflam_metab,
+  width = 16, height = 12, bg = "white", dpi = 150
+)
+```
+
+```{r}
+#| label: tumor-state-hypoxia
+#| fig-width: 10
+#| fig-height: 6
+
+# Libraries ----------
+library(Seurat)
+library(readr)
+
+# Inputs ----------
+seu <- read_rds("checkpoints/05-ep-seu-hallmark.rds")
+
+# Processing ----------
+tumor_states <- c("tumor_undifferentiated", "tumor_transportive",
+                  "tumor_ciliated",         "tumor_mesenchymal")
+seu_tumor <- seu[, seu$cell_class %in% tumor_states]
+seu_tumor$cell_class <- factor(seu_tumor$cell_class, levels = tumor_states)
+
+plot_hypoxia_ridge <- RidgePlot(
+  seu_tumor,
+  features = "HALLMARK_HYPOXIA",
+  group.by = "cell_class"
+) +
+  labs(title = "Hypoxia score across PFA tumor states (MEC expected to dominate)")
+
+# Inspect ----------
+plot_hypoxia_ridge
+
+# Outputs ----------
+ggsave(
+  filename = "write/figures/05-hallmark-hypoxia-tumor-states.pdf",
+  plot = plot_hypoxia_ridge,
+  width = 10, height = 6, bg = "white",
+  device = cairo_pdf
+)
+ggsave(
+  filename = "write/figures/05-hallmark-hypoxia-tumor-states.png",
+  plot = plot_hypoxia_ridge,
+  width = 10, height = 6, bg = "white", dpi = 150
+)
+```
+
+```{r}
+#| label: proliferation-panel
+#| fig-width: 12
+#| fig-height: 10
+
+# Libraries ----------
+library(Seurat)
+library(readr)
+
+# Inputs ----------
+seu <- read_rds("checkpoints/05-ep-seu-hallmark.rds")
+
+# Processing ----------
+prolif_pathways <- c(
+  "HALLMARK_G2M_CHECKPOINT",
+  "HALLMARK_E2F_TARGETS",
+  "HALLMARK_MITOTIC_SPINDLE"
+)
+
+plot_prolif <- VlnPlot(
+  seu,
+  features = prolif_pathways,
+  group.by = "cell_class",
+  pt.size  = 0,
+  ncol     = 1
+) &
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Inspect ----------
+plot_prolif
+
+# Outputs ----------
+ggsave(
+  filename = "write/figures/05-hallmark-proliferation-panel.pdf",
+  plot = plot_prolif,
+  width = 12, height = 10, bg = "white",
+  device = cairo_pdf
+)
+ggsave(
+  filename = "write/figures/05-hallmark-proliferation-panel.png",
+  plot = plot_prolif,
+  width = 12, height = 10, bg = "white", dpi = 150
+)
+```
+
+# Feature-on-UMAP. Hypoxia score, Harmony embedding
+
+-   **Purpose**: one publication-friendly UMAP coloured by the MEC-defining pathway, so MEC's spatial coherence with hypoxia is visible at a glance.
+
+```{r}
+#| label: hypoxia-featureplot
+#| fig-width: 8
+#| fig-height: 7
+
+# Libraries ----------
+library(Seurat)
+library(BadranSeq)
+library(readr)
+
+# Inputs ----------
+seu <- read_rds("checkpoints/05-ep-seu-hallmark.rds")
+
+# Processing ----------
+plot_hypoxia_umap <- do_FeaturePlot(
+  seu,
+  reduction = "umap.harmony",
+  features  = "HALLMARK_HYPOXIA",
+  pt.size   = 0.4,
+  plot_cell_borders = FALSE
+) +
+  labs(title = "Hallmark hypoxia score on Harmony UMAP")
+
+# Inspect ----------
+plot_hypoxia_umap
+
+# Outputs ----------
+ggsave(
+  filename = "write/figures/05-umap-harmony-hypoxia.pdf",
+  plot = plot_hypoxia_umap,
+  width = 8, height = 7, bg = "white",
+  device = cairo_pdf
+)
+ggsave(
+  filename = "write/figures/05-umap-harmony-hypoxia.png",
+  plot = plot_hypoxia_umap,
+  width = 8, height = 7, bg = "white", dpi = 150
+)
+```
+
+# ShinyCell2, rebuild the app with Hallmark scores
+
+-   **Key point**: the 50 Hallmark scores live as continuous metadata columns on the Seurat object, `createConfig(seu)` picks them up automatically. They become queryable as colour variables in the metadata panel of the app.
+-   **App directory**: `write/apps/ep-cellchat-shinyapp-v2/`, parallel to the v1 from notebook 03, so both survive.
+-   **Default**: seed the landing view with `cell_class` × `tumor_subtype` as before; users can swap in any Hallmark pathway from the metadata dropdown.
+
+```{r}
+#| label: shinycell-rebuild
+
+# Libraries ----------
+library(Seurat)
+library(ShinyCell2)
+library(RColorBrewer)
+library(readr)
+
+# Inputs ----------
+seu <- read_rds("checkpoints/05-ep-seu-hallmark.rds")
+
+# Setup ----------
+shiny_dir <- "write/apps/ep-cellchat-shinyapp-v2"
+dir.create(shiny_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Processing ----------
+sc_config <- createConfig(seu)
+
+# Rename the columns I have friendly labels for.
+sc_config <- modMetaName(
+  sc_config,
+  meta.to.mod = c("nCount_RNA", "nFeature_RNA", "percent.mt", "percent.ribo",
+                  "patient_id", "tumor_subtype", "location", "cell_type",
+                  "clusters.harmony", "cell_class"),
+  new.name    = c("UMI count", "Gene count", "% mitochondrial", "% ribosomal",
+                  "Patient", "Tumor subtype", "Anatomical location", "Author label (Gillen)",
+                  "Cluster (Harmony)", "Cell class")
+)
+
+# Custom palette for Cell class ----------
+class_levels  <- sort(unique(seu$cell_class))
+class_palette <- c(
+  immune_myeloid          = "#1F77B4",
+  immune_lymphoid         = "#17BECF",
+  normal_oligodendrocyte  = "#2CA02C",
+  tumor_undifferentiated  = "#D62728",
+  tumor_transportive      = "#FF7F0E",
+  tumor_ciliated          = "#8C564B",
+  tumor_mesenchymal       = "#E377C2",
+  tumor_cycling           = "#BCBD22",
+  tumor_PFA_other         = "#7F7F7F",
+  tumor_PFB               = "#9467BD",
+  tumor_ST_RELA           = "#AEC7E8",
+  tumor_ST_YAP            = "#FFBB78"
+)[class_levels]
+
+sc_config <- modColours(sc_config,
+                        meta.to.mod = "Cell class",
+                        new.colours = unname(class_palette))
+sc_config <- modColours(sc_config,
+                        meta.to.mod = "Tumor subtype",
+                        new.colours = brewer.pal(5, "Dark2"))
+
+sc_config <- modDefault(sc_config, "Cell class", "Tumor subtype")
+checkConfig(sc_config, seu)
+
+write_rds(sc_config, "checkpoints/05-shinycell-config.rds")
+
+# Build shiny files ----------
+makeShinyFiles(
+  seu, sc_config,
+  shiny.prefix      = "sc1",
+  shiny.dir         = shiny_dir,
+  dimred.to.use     = c("umap.harmony", "umap.unintegrated"),
+  default.gene1     = "CSF1R",
+  default.gene2     = "CD3D",
+  default.multigene = c("CSF1R", "CX3CR1", "P2RY12", "CD68", "CD163",
+                        "CD3D", "CD8A", "GFAP", "OLIG2"),
+  default.dimred    = "umap.harmony"
+)
+
+makeShinyCodes(
+  shiny.title     = "Ependymoma scRNA-seq (GSE125969). Harmony + Hallmark module scores",
+  shiny.prefix    = "sc1",
+  shiny.dir       = shiny_dir,
+  shiny.footnotes = "Re-analysis of Gillen et al. 2020 (Cell Reports) with Hallmark AddModuleScore. Badran Elshenawy, 2026."
+)
+```
+
+## Run the rebuilt app locally
+
+```{r}
+#| label: shinycell-run-v2
+#| eval: false
+
+shiny::runApp("write/apps/ep-cellchat-shinyapp-v2")
+```
+
+# Next steps
+
+-   **Notebook 06** (summary / writeup) pulls concrete numbers from 04 (CellChat tables) and 05 (Hallmark mean scores) into the 500–1000 word biological report the brief specifies.
