@@ -19,10 +19,12 @@
 !renv.lock
 !.gitignore
 
-# renv package library/cache internals stay local; the lockfile and .Rprofile
-# above are the reproducibility contract we commit.
-renv/
-renv/**
+# renv package library/cache internals stay local; commit only the activation
+# script, settings, lockfile, and .Rprofile needed to restore the environment.
+!renv/
+renv/*
+!renv/activate.R
+!renv/settings.json
 
 # Expose .gitkeep placeholders so the data-directory structure is visible
 !read/.gitkeep
