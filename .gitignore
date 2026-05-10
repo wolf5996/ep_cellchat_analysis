@@ -15,7 +15,14 @@
 !scripts/**
 !README.md
 !ep-cellchat-analysis.Rproj
+!.Rprofile
+!renv.lock
 !.gitignore
+
+# renv package library/cache internals stay local; the lockfile and .Rprofile
+# above are the reproducibility contract we commit.
+renv/
+renv/**
 
 # Expose .gitkeep placeholders so the data-directory structure is visible
 !read/.gitkeep
